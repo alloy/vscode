@@ -1013,13 +1013,13 @@ impl DevTunnels {
 pub struct StatusLock(Arc<std::sync::Mutex<protocol::singleton::Status>>);
 
 impl StatusLock {
-	fn succeed(&self) {
+	pub(super) fn succeed(&self) {
 		let mut status = self.0.lock().unwrap();
 		status.tunnel = protocol::singleton::TunnelState::Connected;
 		status.last_connected_at = Some(jiff::Timestamp::now());
 	}
 
-	fn fail(&self, reason: String) {
+	pub(super) fn fail(&self, reason: String) {
 		let mut status = self.0.lock().unwrap();
 		if let protocol::singleton::TunnelState::Connected = status.tunnel {
 			status.last_disconnected_at = Some(jiff::Timestamp::now());
@@ -1031,6 +1031,19 @@ impl StatusLock {
 	pub fn read(&self) -> protocol::singleton::Status {
 		let status = self.0.lock().unwrap();
 		status.clone()
+	}
+}
+
+struct TunnelStatusGuard(StatusLock);
+
+impl Drop for TunnelStatusGuard {
+	fn drop(&mut self) {
+		let mut status = self.0 .0.lock().unwrap();
+		if matches!(status.tunnel, protocol::singleton::TunnelState::Connected) {
+			status.tunnel = protocol::singleton::TunnelState::Disconnected;
+			status.last_disconnected_at = Some(jiff::Timestamp::now());
+			status.last_fail_reason = Some("Tunnel relay task stopped".to_string());
+		}
 	}
 }
 
@@ -1195,6 +1208,8 @@ impl ActiveTunnelManager {
 		access_token_provider: impl AccessTokenProvider + 'static,
 		status: StatusLock,
 	) {
+		// The singleton outlives this task, including on cancellation or token failure.
+		let _status_guard = TunnelStatusGuard(status.clone());
 		let mut token_ka = access_token_provider.keep_alive();
 		let mut backoff = Backoff::new(Duration::from_secs(5), Duration::from_secs(120));
 
@@ -1248,12 +1263,16 @@ impl ActiveTunnelManager {
 					if let Err(e) = res {
 						fail!(e, "Tunnel exited unexpectedly, reconnecting");
 					} else {
+						status.fail("Tunnel exited unexpectedly but gracefully, reconnecting".to_string());
 						warning!(log, "Tunnel exited unexpectedly but gracefully, reconnecting");
 						backoff.delay().await;
 					}
 				},
 				Err(e) = &mut token_ka => {
 					error!(log, "access token is no longer valid, exiting: {}", e);
+					let error = wrap(e, "access token is no longer valid");
+					status.fail(error.to_string());
+					endpoint_tx.send(Some(Err(error))).ok();
 					return;
 				},
 				_ = close_rx.recv() => {
@@ -1389,6 +1408,56 @@ fn tunnel_has_host_connection(tunnel: &Tunnel) -> bool {
 #[cfg(test)]
 mod test {
 	use super::*;
+
+	#[tokio::test]
+	async fn cancelled_relay_task_does_not_leave_singleton_connected() {
+		let status = StatusLock::default();
+		let task_status = status.clone();
+		let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+		let task = tokio::spawn(async move {
+			let _guard = TunnelStatusGuard(task_status.clone());
+			task_status.succeed();
+			started_tx.send(()).unwrap();
+			futures::future::pending::<()>().await;
+		});
+		started_rx.await.unwrap();
+		task.abort();
+		assert!(task.await.unwrap_err().is_cancelled());
+
+		let state = status.read();
+		assert!(matches!(
+			state.tunnel,
+			protocol::singleton::TunnelState::Disconnected
+		));
+		assert!(state.last_disconnected_at.is_some());
+		assert_eq!(
+			state.last_fail_reason.as_deref(),
+			Some("Tunnel relay task stopped")
+		);
+	}
+
+	#[tokio::test]
+	async fn relay_task_exit_preserves_specific_failure() {
+		let status = StatusLock::default();
+		let task_status = status.clone();
+		tokio::spawn(async move {
+			let _guard = TunnelStatusGuard(task_status.clone());
+			task_status.succeed();
+			task_status.fail("access token is no longer valid".to_string());
+		})
+		.await
+		.unwrap();
+
+		let state = status.read();
+		assert!(matches!(
+			state.tunnel,
+			protocol::singleton::TunnelState::Disconnected
+		));
+		assert_eq!(
+			state.last_fail_reason.as_deref(),
+			Some("access token is no longer valid")
+		);
+	}
 
 	#[test]
 	fn test_tunnel_correlation_preserves_telemetry_session_id() {

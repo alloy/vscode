@@ -95,8 +95,7 @@ pub fn make_singleton_server(
 	rpc.register_sync(
 		protocol::singleton::METHOD_RESTART,
 		|_: protocol::EmptyObject, ctx| {
-			info!(ctx.log, "restarting tunnel after client request");
-			let _ = ctx.shutdown_tx.send(ShutdownSignal::RpcRestartRequested);
+			request_restart(ctx);
 			Ok(())
 		},
 	);
@@ -145,6 +144,14 @@ pub fn make_singleton_server(
 		current_status,
 		fut,
 	}
+}
+
+fn request_restart(ctx: &SingletonServerContext) {
+	info!(ctx.log, "restarting tunnel after client request");
+	if let Some(status) = ctx.current_status.lock().unwrap().as_ref() {
+		status.lock.fail("Tunnel restart requested".to_string());
+	}
+	let _ = ctx.shutdown_tx.send(ShutdownSignal::RpcRestartRequested);
 }
 
 pub async fn start_singleton_server(
@@ -295,5 +302,41 @@ impl log::LogSink for BroadcastLogSink {
 
 	fn write_result(&self, message: &str) {
 		self.write_log(log::Level::Info, "", message);
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::tunnels::protocol::singleton::TunnelState;
+
+	#[test]
+	fn restart_marks_disconnected_before_relay_cleanup_can_block() {
+		let status = StatusLock::default();
+		status.succeed();
+		let (shutdown_tx, mut shutdown_rx) = broadcast::channel(4);
+		let (broadcast_tx, _) = broadcast::channel(4);
+		let ctx = SingletonServerContext {
+			log: log::Logger::test(),
+			shutdown_tx,
+			broadcast_tx,
+			current_status: Arc::new(Mutex::new(Some(StatusInfo {
+				name: "test-host".to_string(),
+				tunnel_id: "test-id".to_string(),
+				lock: status.clone(),
+			}))),
+		};
+
+		request_restart(&ctx);
+
+		assert!(matches!(status.read().tunnel, TunnelState::Disconnected));
+		assert_eq!(
+			status.read().last_fail_reason.as_deref(),
+			Some("Tunnel restart requested")
+		);
+		assert!(matches!(
+			shutdown_rx.try_recv().unwrap(),
+			ShutdownSignal::RpcRestartRequested
+		));
 	}
 }

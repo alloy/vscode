@@ -124,21 +124,8 @@ pub async fn start_singleton_client(args: SingletonClientArgs) -> bool {
 					protocol::EmptyObject {},
 				);
 
-			// we want to ensure the "listening" string always gets printed for
-			// consumers (i.e. VS Code). Ask for it. If the tunnel is not currently
-			// connected though, it will be soon, and that'll be in the log replays.
 			if let Ok(Ok(s)) = res.await {
-				if let Some(name) = s.name {
-					// Older singletons may serve only the agent-host port.
-					let serves_editor = s.has_editor_link.unwrap_or(true);
-					print_listening(&c.log, &name, serves_editor);
-					machine_status::emit_connected(
-						&name,
-						s.tunnel_id.as_deref(),
-						true,
-						serves_editor,
-					);
-				}
+				report_attached_status(&c.log, s);
 			}
 
 			Ok(())
@@ -170,6 +157,21 @@ pub async fn start_singleton_client(args: SingletonClientArgs) -> bool {
 	let _ = start_json_rpc(rpc.build(args.log), read, write, msg_rx, args.shutdown).await;
 
 	exit_entirely.load(Ordering::SeqCst)
+}
+
+fn report_attached_status(log: &log::Logger, status: protocol::singleton::StatusWithTunnelName) {
+	if !matches!(
+		status.status.tunnel,
+		protocol::singleton::TunnelState::Connected
+	) {
+		return;
+	}
+
+	if let Some(name) = status.name {
+		let serves_editor = status.has_editor_link.unwrap_or(true);
+		print_listening(log, &name, serves_editor);
+		machine_status::emit_connected(&name, status.tunnel_id.as_deref(), true, serves_editor);
+	}
 }
 
 pub async fn do_single_rpc_call<
@@ -210,4 +212,38 @@ pub async fn do_single_rpc_call<
 	let r = caller.call(method, params).await.unwrap();
 	rpc.abort();
 	r.map_err(CodeError::TunnelRpcCallFailed)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::sync::Mutex;
+
+	#[derive(Clone, Default)]
+	struct CapturedLog(Arc<Mutex<Vec<String>>>);
+
+	impl log::LogSink for CapturedLog {
+		fn write_log(&self, _: log::Level, _: &str, message: &str) {
+			self.0.lock().unwrap().push(message.to_string());
+		}
+
+		fn write_result(&self, message: &str) {
+			self.0.lock().unwrap().push(message.to_string());
+		}
+	}
+
+	#[test]
+	fn attached_disconnected_tunnel_does_not_report_listening() {
+		let sink = CapturedLog::default();
+		let log = log::Logger::test().with_sink(sink.clone());
+		report_attached_status(
+			&log,
+			protocol::singleton::StatusWithTunnelName {
+				name: Some("offline-host".to_string()),
+				..Default::default()
+			},
+		);
+
+		assert!(sink.0.lock().unwrap().is_empty());
+	}
 }
