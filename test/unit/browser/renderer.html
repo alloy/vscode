@@ -228,6 +228,24 @@
 			select(mocha.suite);
 		}
 
+		// Marks the listed tests and suites pending, as it.skip and suite.skip do, so that mocha
+		// runs neither them nor their hooks.
+		function skipKnownFailures(titles) {
+			if (!titles?.length) {
+				return;
+			}
+			const skipped = new Set(titles);
+			function skip(suite) {
+				for (const runnable of [suite, ...suite.tests]) {
+					if (!runnable.root && skipped.has(runnable.fullTitle())) {
+						runnable.pending = true;
+					}
+				}
+				suite.suites.forEach(skip);
+			}
+			skip(mocha.suite);
+		}
+
 		function serializeSuite(suite) {
 			return {
 				root: suite.root,
@@ -385,7 +403,7 @@
 	</script>
 
 	<script type="text" id="bootstrap">
-		const {data: {modules, grep, rerunTargets, claimTestFiles, isolationProbes}, manual} = await globalThis._VSCODE_TEST_RUN
+		const {data: {modules, grep, rerunTargets, claimTestFiles, isolationProbes, knownFailures}, manual} = await globalThis._VSCODE_TEST_RUN
 
 		try {
 			// load
@@ -398,6 +416,7 @@
 			installIsolationCheck(mocha.suite, [...defaultIsolationDetectors, menuChangeListenerDetector, ...(isolationProbes ? [animationFrameQueueDetector] : [])]);
 			await loadModules(modules);
 			prepareTestsForRerun(rerunTargets);
+			skipKnownFailures(knownFailures);
 			if (testFiles) {
 				parallelTestFiles.distributeTestFiles(mocha.suite, testFiles, createTestFileClaims());
 			}

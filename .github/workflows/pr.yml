@@ -639,6 +639,8 @@ jobs:
       electron_smoke_affected: ${{ needs.changes.result != 'success' || needs.changes.outputs.product-tests == 'true' }}
       browser_unit_affected: ${{ needs.changes.result != 'success' || needs.changes.outputs.selected-browser-unit-tests == 'true' }}
       browser_affected: ${{ needs.changes.result != 'success' || needs.changes.outputs.browser-integration == 'true' }}
+      # A trial that only the merge queue runs, and that cannot fail the workflow (see the Browser-Unit (WebKit) job)
+      browser_unit_webkit_trial: ${{ github.event_name == 'merge_group' && (needs.changes.result != 'success' || needs.changes.outputs.selected-browser-unit-tests == 'true') }}
       remote_affected: ${{ needs.changes.result != 'success' || needs.changes.outputs.product-tests == 'true' }}
       # The Electron (node.js) job runs only the node.js integration tests that the plan selects, and is
       # skipped when it selects none.

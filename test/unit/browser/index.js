@@ -37,6 +37,7 @@ const { execFile } = require('node:child_process');
  * tfs: string;
  * 'stall-timeout': string;
  * 'rerun-failed-files': string;
+ * 'known-failures': string;
  * workers: string;
  * worker: string;
  * workerDir: string;
@@ -48,7 +49,7 @@ const { execFile } = require('node:child_process');
 */
 const args = minimist(process.argv.slice(2), {
 	boolean: ['build', 'debug', 'sequential', 'help'],
-	string: ['run', 'runList', 'grep', 'runGlob', 'browser', 'reporter', 'reporter-options', 'tfs', 'stall-timeout', 'rerun-failed-files', 'workers', 'worker', 'workerDir'],
+	string: ['run', 'runList', 'grep', 'runGlob', 'browser', 'reporter', 'reporter-options', 'tfs', 'stall-timeout', 'rerun-failed-files', 'known-failures', 'workers', 'worker', 'workerDir'],
 	default: {
 		build: false,
 		browser: ['chromium', 'firefox', 'webkit'],
@@ -75,6 +76,7 @@ const args = minimist(process.argv.slice(2), {
 		tfs: 'tfs',
 		'stall-timeout': 'abort with diagnostics when no test progress is reported for <seconds> (0 disables)',
 		'rerun-failed-files': 'rerun the failed tests in a freshly launched browser up to <count> more times',
+		'known-failures': 'skip the tests and suites whose full titles <file> lists',
 		workers: 'run all test files, or those of --runList, in <count> parallel processes, each with its own browser',
 		help: 'show the help'
 	}
@@ -96,6 +98,7 @@ Options:
 --tfs <tfs>          tfs
 --stall-timeout <seconds> abort with diagnostics when no test progress is reported for <seconds> (default 300, 0 disables)
 --rerun-failed-files <count> rerun the failed tests (the suite of a failed hook) in a freshly launched browser up to <count> more times, or their whole test files when there are too many failures
+--known-failures <file> skip the tests and suites whose full titles <file> lists, a JSON file of { "tests": [{ "title", "reason" }] }, such as the known failures of a browser
 --workers <count>    run all test files, or those of --runList, in <count> parallel processes, each with its own browser, at most one per CPU and per 2 GB of memory; with --runList, one per 75 test files that run, but at least 2 and at most one per file; browsers run one at a time; ignored with --run, --runGlob, --grep or --debug; reruns use one browser
 --help, -h           show the help`);
 	process.exit(0);
@@ -103,6 +106,18 @@ Options:
 
 // --runList: the listed test files as compiled modules relative to the output folder (src/vs/a.test.ts is vs/a.test.js)
 const runList = args.runList ? new Set(fs.readFileSync(args.runList, 'utf8').split(/\r?\n/).map(line => line.trim().replace(/\\/g, '/')).filter(line => line.length > 0).map(line => line.replace(/^src\//, '').replace(/\.ts$/, '.js'))) : undefined;
+
+/** --known-failures: the full titles of the tests and suites to skip */
+let knownFailures = /** @type {string[] | undefined} */ (undefined);
+if (args['known-failures']) {
+	const entries = JSON.parse(fs.readFileSync(args['known-failures'], 'utf8')).tests;
+	const invalid = Array.isArray(entries) ? entries.filter(entry => typeof entry?.title !== 'string' || !entry.title || typeof entry.reason !== 'string' || !entry.reason) : [entries];
+	if (invalid.length > 0) {
+		console.error(`${args['known-failures']}: every entry of "tests" needs a "title" and a "reason": ${JSON.stringify(invalid)}`);
+		process.exit(1);
+	}
+	knownFailures = entries.map(entry => entry.title);
+}
 
 const isDebug = !!args.debug;
 const stallTimeoutMs = isDebug ? 0 : Math.max(0, Number(args['stall-timeout']) || 0) * 1000;
@@ -447,6 +462,7 @@ async function runTestsInBrowser(testModules, browserType, browserChannel, grep,
 			rerunTargets,
 			claimTestFiles: !!claims,
 			isolationProbes: !!process.env.VSCODE_TEST_ISOLATION_REPORT,
+			knownFailures,
 		});
 		await writeIsolationFindings(page, browserType);
 	} finally {
