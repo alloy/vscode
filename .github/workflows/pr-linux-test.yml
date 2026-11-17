@@ -782,13 +782,14 @@ jobs:
   # A trial of the browser unit tests in WebKit on Linux, which the merge queue runs to catch the
   # failures that only the WebKit unit tests of the macOS product build caught before. It cannot fail the
   # workflow (continue-on-error), and skips the tests of webkit-linux-known-failures.json, which fail in
-  # WebKit on Linux but not in Chromium. Its timeouts keep it shorter than the slowest job of the
-  # merge queue.
+  # WebKit on Linux but not in Chromium. Its timeout keeps it within the slowest job of the merge
+  # queue (about 13 minutes), which PR Gate waits for anyway: a full run takes about 8 minutes.
   browser-unit-webkit:
     name: Browser-Unit (WebKit)
     if: ${{ inputs.browser_unit_webkit_trial }}
     runs-on: ${{ inputs.runner }}
     continue-on-error: true
+    timeout-minutes: 12
     env:
       ARTIFACT_NAME: browser-unit-webkit
       BROWSER_TESTS: 'true'
