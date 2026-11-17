@@ -1032,6 +1032,11 @@ impl StatusLock {
 		let status = self.0.lock().unwrap();
 		status.clone()
 	}
+
+	#[cfg(test)]
+	pub(super) fn connect_for_regression(&self) {
+		self.succeed();
+	}
 }
 
 struct ActiveTunnelManager {
@@ -1190,11 +1195,54 @@ impl ActiveTunnelManager {
 	async fn spawn_tunnel(
 		log: log::Logger,
 		relay: Arc<tokio::sync::Mutex<RelayTunnelHost>>,
-		mut close_rx: mpsc::Receiver<()>,
+		close_rx: mpsc::Receiver<()>,
 		endpoint_tx: watch::Sender<Option<Result<TunnelEndpoint, WrappedError>>>,
 		access_token_provider: impl AccessTokenProvider + 'static,
 		status: StatusLock,
 	) {
+		Self::run_tunnel(
+			log,
+			move |access_token: String| {
+				let relay = relay.clone();
+				async move {
+					relay
+						.lock()
+						.await
+						.connect(&access_token)
+						.await
+						.map_err(|e| wrap(e, "error connecting to tunnel"))
+				}
+				.boxed()
+			},
+			|handle: &tunnels::connections::RelayHandle| handle.endpoint().clone(),
+			|handle: tunnels::connections::RelayHandle| async move {
+				format!("{:?}", handle.close().await)
+			},
+			close_rx,
+			endpoint_tx,
+			access_token_provider,
+			status,
+		)
+		.await;
+	}
+
+	// Only the SDK connection boundary is injectable; the lifecycle loop is shared.
+	#[allow(clippy::too_many_arguments)]
+	async fn run_tunnel<H, E, C, CF>(
+		log: log::Logger,
+		mut connect: impl FnMut(String) -> BoxFuture<'static, Result<H, WrappedError>> + Send,
+		endpoint: impl Fn(&H) -> TunnelEndpoint + Send,
+		mut close: C,
+		mut close_rx: mpsc::Receiver<()>,
+		endpoint_tx: watch::Sender<Option<Result<TunnelEndpoint, WrappedError>>>,
+		access_token_provider: impl AccessTokenProvider + 'static,
+		status: StatusLock,
+	) where
+		H: Future<Output = Result<(), E>> + Unpin + Send,
+		E: std::fmt::Display,
+		C: FnMut(H) -> CF + Send,
+		CF: Future<Output = String> + Send,
+	{
 		let mut token_ka = access_token_provider.keep_alive();
 		let mut backoff = Backoff::new(Duration::from_secs(5), Duration::from_secs(120));
 
@@ -1221,13 +1269,7 @@ impl ActiveTunnelManager {
 
 			// we don't bother making a client that can refresh the token, since
 			// the tunnel won't be able to host as soon as the access token expires.
-			let handle_res = {
-				let mut relay = relay.lock().await;
-				relay
-					.connect(&access_token)
-					.await
-					.map_err(|e| wrap(e, "error connecting to tunnel"))
-			};
+			let handle_res = connect(access_token).await;
 
 			let mut handle = match handle_res {
 				Ok(handle) => handle,
@@ -1239,7 +1281,7 @@ impl ActiveTunnelManager {
 
 			backoff.reset();
 			status.succeed();
-			endpoint_tx.send(Some(Ok(handle.endpoint().clone()))).ok();
+			endpoint_tx.send(Some(Ok(endpoint(&handle)))).ok();
 
 			tokio::select! {
 				// error is mapped like this prevent it being used across an await,
@@ -1258,13 +1300,17 @@ impl ActiveTunnelManager {
 				},
 				_ = close_rx.recv() => {
 					trace!(log, "Tunnel closing gracefully");
-					trace!(log, "Tunnel closed with result: {:?}", handle.close().await);
+					trace!(log, "Tunnel closed with result: {}", close(handle).await);
 					break;
 				}
 			}
 		}
 	}
 }
+
+#[cfg(test)]
+#[path = "stale_health_relay_tests.rs"]
+mod stale_health_regression;
 
 struct Backoff {
 	failures: u32,

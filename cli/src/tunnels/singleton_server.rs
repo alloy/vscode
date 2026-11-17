@@ -37,6 +37,10 @@ use tokio::{
 	task::JoinHandle,
 };
 
+#[cfg(test)]
+#[path = "stale_health_rpc_tests.rs"]
+pub(super) mod stale_health_regression;
+
 pub struct SingletonServerArgs<'a> {
 	pub server: &'a mut RpcServer,
 	pub log: log::Logger,
