@@ -33,7 +33,7 @@ use crate::{
 use futures::future::Either;
 use tokio::{
 	pin,
-	sync::{broadcast, mpsc},
+	sync::{broadcast, mpsc, watch},
 	task::JoinHandle,
 };
 
@@ -61,6 +61,13 @@ struct StatusInfo {
 }
 
 #[derive(Clone)]
+struct ConnectionReporter {
+	name: String,
+	tunnel_id: String,
+	status: watch::Receiver<protocol::singleton::Status>,
+}
+
+#[derive(Clone)]
 struct SingletonServerContext {
 	log: log::Logger,
 	shutdown_tx: broadcast::Sender<ShutdownSignal>,
@@ -77,6 +84,22 @@ pub struct RpcServer {
 	fut: JoinHandle<Result<(), CodeError>>,
 	shutdown_broadcast: broadcast::Sender<ShutdownSignal>,
 	current_status: Arc<Mutex<Option<StatusInfo>>>,
+	status_reports: watch::Sender<Option<ConnectionReporter>>,
+}
+
+impl RpcServer {
+	fn set_current_status(&mut self, status: StatusInfo) {
+		let mut changes = status.lock.subscribe();
+		// Initial readiness is reported by startup, not by this reconnect observer.
+		changes.borrow_and_update();
+		let reporter = ConnectionReporter {
+			name: status.name.clone(),
+			tunnel_id: status.tunnel_id.clone(),
+			status: changes,
+		};
+		*self.current_status.lock().unwrap() = Some(status);
+		self.status_reports.send_replace(Some(reporter));
+	}
 }
 
 pub fn make_singleton_server(
@@ -89,6 +112,7 @@ pub fn make_singleton_server(
 	let rpc = new_json_rpc();
 
 	let current_status = Arc::new(Mutex::default());
+	let (status_reports, status_reports_rx) = watch::channel(None);
 	let mut rpc = rpc.methods(SingletonServerContext {
 		log: log.clone(),
 		shutdown_tx: shutdown_broadcast.clone(),
@@ -141,11 +165,20 @@ pub fn make_singleton_server(
 	// we tokio spawn instead of keeping a future, since we want it to progress
 	// even outside of the start_singleton_server loop (i.e. while the tunnel restarts)
 	let fut = tokio::spawn(async move {
-		serve_singleton_rpc(log_broadcast, server, rpc.build(log), shutdown_rx).await
+		serve_singleton_rpc(
+			log_broadcast,
+			server,
+			rpc.build(log.clone()),
+			log,
+			status_reports_rx,
+			shutdown_rx,
+		)
+		.await
 	});
 	RpcServer {
 		shutdown_broadcast,
 		current_status,
+		status_reports,
 		fut,
 	}
 }
@@ -176,13 +209,12 @@ pub async fn start_singleton_server(
 	]);
 
 	{
-		print_listening(&args.log, &args.tunnel.name, true);
-		let mut status = args.server.current_status.lock().unwrap();
-		*status = Some(StatusInfo {
+		args.server.set_current_status(StatusInfo {
 			name: args.tunnel.name.clone(),
 			tunnel_id: args.tunnel.id.clone(),
 			lock: args.tunnel.status(),
-		})
+		});
+		print_listening(&args.log, &args.tunnel.name, true);
 	}
 
 	let serve_fut = super::serve(
@@ -216,16 +248,21 @@ async fn serve_singleton_rpc<C: Clone + Send + Sync + 'static>(
 	log_broadcast: BroadcastLogSink,
 	mut server: SingletonServer,
 	dispatcher: RpcDispatcher<JsonRpcSerializer, C>,
+	log: log::Logger,
+	status_reports: watch::Receiver<Option<ConnectionReporter>>,
 	shutdown_rx: Barrier<ShutdownSignal>,
 ) -> Result<(), CodeError> {
 	let mut own_shutdown = shutdown_rx.clone();
 	let shutdown_fut = own_shutdown.wait();
 	pin!(shutdown_fut);
+	let reports = report_reconnections(log, status_reports);
+	pin!(reports);
 
 	loop {
 		let cnx = tokio::select! {
 			c = server.accept() => c?,
 			_ = &mut shutdown_fut => return Ok(()),
+			_ = &mut reports => return Ok(()),
 		};
 
 		let (read, write) = socket_stream_split(cnx);
@@ -235,6 +272,51 @@ async fn serve_singleton_rpc<C: Clone + Send + Sync + 'static>(
 		tokio::spawn(async move {
 			let _ = start_json_rpc(dispatcher.clone(), read, write, msg_rx, shutdown_rx).await;
 		});
+	}
+}
+
+async fn report_reconnections(
+	log: log::Logger,
+	mut reports: watch::Receiver<Option<ConnectionReporter>>,
+) {
+	loop {
+		let next = reports.borrow_and_update().clone();
+		let Some(mut reporter) = next else {
+			if reports.changed().await.is_err() {
+				return;
+			}
+			continue;
+		};
+
+		loop {
+			tokio::select! {
+				biased;
+				changed = reports.changed() => {
+					if changed.is_err() {
+						return;
+					}
+					break;
+				},
+				changed = reporter.status.changed() => {
+					if changed.is_err() {
+						if reports.changed().await.is_err() {
+							return;
+						}
+						break;
+					}
+					let connected = matches!(
+						reporter.status.borrow_and_update().tunnel,
+						protocol::singleton::TunnelState::Connected
+					);
+					if connected {
+						print_listening(&log, &reporter.name, true);
+						machine_status::emit_connected(
+							&reporter.name, Some(&reporter.tunnel_id), false, true,
+						);
+					}
+				}
+			}
+		}
 	}
 }
 

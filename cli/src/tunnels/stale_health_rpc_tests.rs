@@ -78,9 +78,13 @@ impl Fixture {
 			);
 		}
 		let (shutdown, shutdown_opener) = new_barrier();
-		let server =
-			make_singleton_server(broadcast.clone(), log::Logger::test(), singleton, shutdown);
-		*server.current_status.lock().unwrap() = Some(StatusInfo {
+		let mut server = make_singleton_server(
+			broadcast.clone(),
+			log::Logger::test().with_sink(broadcast.clone()),
+			singleton,
+			shutdown,
+		);
+		server.set_current_status(StatusInfo {
 			name: "offline-regression-host".to_string(),
 			tunnel_id: "offline-regression-id".to_string(),
 			lock: status.clone(),
@@ -160,6 +164,19 @@ impl Fixture {
 			.iter()
 			.filter(|line| line.contains("is listening for incoming connections"))
 			.count()
+	}
+
+	async fn wait_for_readiness(&self, count: usize) {
+		tokio::time::timeout(Duration::from_secs(2), async {
+			loop {
+				if self.listening_count() >= count && self.stdout.events().len() >= count {
+					break;
+				}
+				tokio::time::sleep(Duration::from_millis(5)).await;
+			}
+		})
+		.await
+		.unwrap();
 	}
 }
 
@@ -285,6 +302,65 @@ async fn subsequent_real_readiness_notifications_reach_attached_consumers() {
 	.await
 	.unwrap();
 	assert_eq!(fixture.machine.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn reconnect_observer_reports_each_connection_without_disconnect_readiness() {
+	let status = StatusLock::default();
+	let mut fixture = Fixture::with_status(status.clone(), false).await;
+	fixture.attach().await;
+
+	for count in 1..=2 {
+		status.connect_for_regression();
+		fixture.wait_for_readiness(count).await;
+		status.fail("synthetic disconnect".to_string());
+	}
+	tokio::time::sleep(Duration::from_millis(100)).await;
+
+	assert_eq!(
+		(fixture.listening_count(), fixture.stdout.events().len()),
+		(2, 2)
+	);
+	assert!(fixture.stdout.events().iter().all(|event| matches!(
+		event,
+		MachineStatus::Connected {
+			is_attached: false,
+			..
+		}
+	)));
+}
+
+#[tokio::test]
+async fn reconnect_observer_follows_replacement_instead_of_old_manager() {
+	let old = StatusLock::default();
+	let mut fixture = Fixture::with_status(old.clone(), false).await;
+	fixture.attach().await;
+	let replacement = StatusLock::default();
+	fixture.server.set_current_status(StatusInfo {
+		name: "replacement-host".to_string(),
+		tunnel_id: "replacement-id".to_string(),
+		lock: replacement.clone(),
+	});
+
+	old.connect_for_regression();
+	replacement.connect_for_regression();
+	fixture.wait_for_readiness(1).await;
+	old.fail("old manager disconnected".to_string());
+	old.connect_for_regression();
+	tokio::time::sleep(Duration::from_millis(100)).await;
+
+	assert_eq!(
+		(fixture.listening_count(), fixture.stdout.events().len()),
+		(1, 1)
+	);
+	assert!(matches!(
+		fixture.stdout.events().as_slice(),
+		[MachineStatus::Connected {
+			tunnel_name,
+			tunnel_id: Some(id),
+			..
+		}] if tunnel_name == "replacement-host" && id == "replacement-id"
+	));
 }
 
 pub(in crate::tunnels) async fn assert_connection_produces_readiness(

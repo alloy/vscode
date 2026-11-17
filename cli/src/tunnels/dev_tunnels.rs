@@ -1009,28 +1009,52 @@ impl DevTunnels {
 	}
 }
 
-#[derive(Clone, Default)]
-pub struct StatusLock(Arc<std::sync::Mutex<protocol::singleton::Status>>);
+#[derive(Clone)]
+pub struct StatusLock(watch::Sender<protocol::singleton::Status>);
+
+impl Default for StatusLock {
+	fn default() -> Self {
+		Self(watch::channel(protocol::singleton::Status::default()).0)
+	}
+}
 
 impl StatusLock {
 	pub(super) fn succeed(&self) {
-		let mut status = self.0.lock().unwrap();
-		status.tunnel = protocol::singleton::TunnelState::Connected;
-		status.last_connected_at = Some(jiff::Timestamp::now());
+		self.0.send_modify(|status| {
+			status.tunnel = protocol::singleton::TunnelState::Connected;
+			status.last_connected_at = Some(jiff::Timestamp::now());
+		});
 	}
 
 	pub(super) fn fail(&self, reason: String) {
-		let mut status = self.0.lock().unwrap();
-		if let protocol::singleton::TunnelState::Connected = status.tunnel {
-			status.last_disconnected_at = Some(jiff::Timestamp::now());
-			status.tunnel = protocol::singleton::TunnelState::Disconnected;
-		}
-		status.last_fail_reason = Some(reason);
+		self.0.send_modify(|status| {
+			if let protocol::singleton::TunnelState::Connected = status.tunnel {
+				status.last_disconnected_at = Some(jiff::Timestamp::now());
+				status.tunnel = protocol::singleton::TunnelState::Disconnected;
+			}
+			status.last_fail_reason = Some(reason);
+		});
+	}
+
+	fn disconnect_if_connected(&self) {
+		self.0.send_if_modified(|status| {
+			if matches!(status.tunnel, protocol::singleton::TunnelState::Connected) {
+				status.tunnel = protocol::singleton::TunnelState::Disconnected;
+				status.last_disconnected_at = Some(jiff::Timestamp::now());
+				status.last_fail_reason = Some("Tunnel relay task stopped".to_string());
+				true
+			} else {
+				false
+			}
+		});
 	}
 
 	pub fn read(&self) -> protocol::singleton::Status {
-		let status = self.0.lock().unwrap();
-		status.clone()
+		self.0.borrow().clone()
+	}
+
+	pub(super) fn subscribe(&self) -> watch::Receiver<protocol::singleton::Status> {
+		self.0.subscribe()
 	}
 
 	#[cfg(test)]
@@ -1043,12 +1067,7 @@ struct TunnelStatusGuard(StatusLock);
 
 impl Drop for TunnelStatusGuard {
 	fn drop(&mut self) {
-		let mut status = self.0 .0.lock().unwrap();
-		if matches!(status.tunnel, protocol::singleton::TunnelState::Connected) {
-			status.tunnel = protocol::singleton::TunnelState::Disconnected;
-			status.last_disconnected_at = Some(jiff::Timestamp::now());
-			status.last_fail_reason = Some("Tunnel relay task stopped".to_string());
-		}
+		self.0.disconnect_if_connected();
 	}
 }
 
@@ -1189,6 +1208,7 @@ impl ActiveTunnelManager {
 	/// Kills the process, and waits for it to exit.
 	/// See https://tokio.rs/tokio/topics/shutdown#waiting-for-things-to-finish-shutting-down for how this works
 	pub async fn kill(&mut self) -> Result<(), AnyError> {
+		self.status.disconnect_if_connected();
 		if let Some(tx) = self.close_tx.take() {
 			drop(tx);
 		}
@@ -1318,6 +1338,7 @@ impl ActiveTunnelManager {
 					return;
 				},
 				_ = close_rx.recv() => {
+					status.disconnect_if_connected();
 					trace!(log, "Tunnel closing gracefully");
 					trace!(log, "Tunnel closed with result: {}", close(handle).await);
 					break;
