@@ -51,6 +51,9 @@ fn status_sink() -> &'static RwLock<Option<MachineStatusSink>> {
 static TEST_STDOUT_SINK: OnceLock<RwLock<Option<MachineStatusSink>>> = OnceLock::new();
 
 #[cfg(test)]
+pub(super) static STATUS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
 fn test_stdout_sink() -> &'static RwLock<Option<MachineStatusSink>> {
 	TEST_STDOUT_SINK.get_or_init(|| RwLock::new(None))
 }
@@ -96,6 +99,48 @@ fn emit_to_stdout(status: &MachineStatus) {
 	println!("{}", status_line(status));
 }
 
+#[cfg(test)]
+pub(super) struct RegressionStdoutCapture {
+	events: Arc<std::sync::Mutex<Vec<MachineStatus>>>,
+	previous: Option<MachineStatusSink>,
+	enabled: bool,
+}
+
+#[cfg(test)]
+impl RegressionStdoutCapture {
+	pub(super) fn new() -> Self {
+		let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+		let captured = events.clone();
+		let previous = test_stdout_sink()
+			.write()
+			.unwrap()
+			.replace(Arc::new(move |event| {
+				captured.lock().unwrap().push(event.clone())
+			}));
+		Self {
+			events,
+			previous,
+			enabled: STDOUT_ENABLED.load(Ordering::Relaxed),
+		}
+	}
+
+	pub(super) fn events(&self) -> Vec<MachineStatus> {
+		self.events.lock().unwrap().clone()
+	}
+
+	pub(super) fn clear(&self) {
+		self.events.lock().unwrap().clear();
+	}
+}
+
+#[cfg(test)]
+impl Drop for RegressionStdoutCapture {
+	fn drop(&mut self) {
+		*test_stdout_sink().write().unwrap() = self.previous.take();
+		STDOUT_ENABLED.store(self.enabled, Ordering::Relaxed);
+	}
+}
+
 pub fn emit_connected(
 	tunnel_name: &str,
 	tunnel_id: Option<&str>,
@@ -138,10 +183,8 @@ mod tests {
 
 	use super::{
 		emit_token_error, install_sink, set_stdout_enabled, status_line, status_sink,
-		test_stdout_sink, MachineStatus, STDOUT_ENABLED,
+		test_stdout_sink, MachineStatus, STATUS_TEST_LOCK, STDOUT_ENABLED,
 	};
-
-	static STATUS_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 	struct ResetMachineStatus;
 
@@ -193,7 +236,7 @@ mod tests {
 
 	#[test]
 	fn relays_token_errors_when_stdout_is_disabled() {
-		let _lock = STATUS_TEST_LOCK.lock().unwrap();
+		let _lock = STATUS_TEST_LOCK.blocking_lock();
 		let _reset = ResetMachineStatus;
 		set_stdout_enabled(false);
 		let received = Arc::new(Mutex::new(Vec::new()));
@@ -212,7 +255,7 @@ mod tests {
 
 	#[test]
 	fn relays_and_writes_token_errors_when_stdout_is_enabled() {
-		let _lock = STATUS_TEST_LOCK.lock().unwrap();
+		let _lock = STATUS_TEST_LOCK.blocking_lock();
 		let _reset = ResetMachineStatus;
 		set_stdout_enabled(true);
 		let relayed = Arc::new(Mutex::new(Vec::new()));
