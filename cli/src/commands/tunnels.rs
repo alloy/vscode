@@ -137,6 +137,7 @@ impl ServiceContainer for TunnelServiceContainer {
 			},
 			csa,
 			TUNNEL_SERVICE_LOCK_NAME,
+			true,
 		)
 		.await?;
 		Ok(())
@@ -486,7 +487,7 @@ pub async fn serve(ctx: CommandContext, gateway_args: TunnelServeArgs) -> Result
 
 	let mut csa = (&args).into();
 	gateway_args.server_args.apply_to(&mut csa);
-	let result = serve_with_csa(paths, log, gateway_args, csa, TUNNEL_CLI_LOCK_NAME).await;
+	let result = serve_with_csa(paths, log, gateway_args, csa, TUNNEL_CLI_LOCK_NAME, false).await;
 	drop(no_sleep);
 
 	result
@@ -594,6 +595,7 @@ async fn serve_with_csa(
 	gateway_args: TunnelServeArgs,
 	mut csa: CodeServerArgs,
 	app_mutex_name: Option<&'static str>,
+	non_interactive: bool,
 ) -> Result<i32, AnyError> {
 	machine_status::set_stdout_enabled(gateway_args.machine_status);
 
@@ -669,19 +671,58 @@ async fn serve_with_csa(
 	let platform = PreReqChecker::new().verify().await?;
 	let _lock = app_mutex_name.map(AppMutex::new);
 
-	let auth = Auth::new(&paths, log.clone());
-	let mut dt = dev_tunnels::DevTunnels::new_remote_tunnel(&log, auth, &paths);
+	let mut auth = Auth::new(&paths, log.clone());
+	if non_interactive {
+		auth.set_non_interactive();
+	}
+	let mut dt = dev_tunnels::DevTunnels::new_remote_tunnel(&log, auth.clone(), &paths);
 	loop {
-		let tunnel = if let Some(t) =
-			fulfill_existing_tunnel_args(gateway_args.tunnel.clone(), &gateway_args.name)
-		{
-			dt.start_existing_tunnel(t).await
-		} else {
-			tokio::select! {
-				t = dt.start_new_launcher_tunnel(gateway_args.name.as_deref(), gateway_args.random_name, &[CONTROL_PORT, AGENT_HOST_PORT]) => t,
-				_ = shutdown.wait() => return Ok(1),
+		let mut retry_delay = Duration::from_secs(5);
+		let tunnel = loop {
+			let start = async {
+				if let Some(t) =
+					fulfill_existing_tunnel_args(gateway_args.tunnel.clone(), &gateway_args.name)
+				{
+					dt.start_existing_tunnel(t).await
+				} else {
+					dt.start_new_launcher_tunnel(
+						gateway_args.name.as_deref(),
+						gateway_args.random_name,
+						&[CONTROL_PORT, AGENT_HOST_PORT],
+					)
+					.await
+				}
+			};
+			let result = tokio::select! {
+				result = start => result,
+				_ = shutdown.wait() => return Ok(0),
+			};
+			match result {
+				Ok(tunnel) => break tunnel,
+				Err(error @ AnyError::RelayCleanupError(_)) => return Err(error),
+				Err(error) if non_interactive => {
+					server
+						.report_startup_failure(error.to_string(), auth.authentication_required());
+					warning!(
+						log,
+						"Tunnel startup failed; retrying without interactive login: {}",
+						error
+					);
+					if auth.authentication_required() {
+						machine_status::emit_token_error(
+							"Authentication required; run tunnel user login in a separate terminal"
+								.to_string(),
+						);
+					}
+				}
+				Err(error) => return Err(error),
 			}
-		}?;
+			tokio::select! {
+				_ = shutdown.wait() => return Ok(0),
+				_ = tokio::time::sleep(retry_delay) => {},
+			}
+			retry_delay = (retry_delay * 2).min(Duration::from_secs(120));
+		};
 
 		csa.connection_token = Some(get_connection_token(&tunnel));
 
@@ -698,7 +739,7 @@ async fn serve_with_csa(
 			server: &mut server,
 		})
 		.await?;
-		r.tunnel.close().await.ok();
+		r.tunnel.close().await?;
 
 		match r.next {
 			Next::Respawn => {

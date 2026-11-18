@@ -42,6 +42,29 @@ struct Fixture {
 	_machine_lock: tokio::sync::MutexGuard<'static, ()>,
 }
 
+#[tokio::test]
+async fn startup_authentication_failure_is_visible_before_tunnel_registration() {
+	let fixture = Fixture::new(false, false).await;
+	*fixture.server.current_status.lock().unwrap() = None;
+	fixture.server.report_startup_failure(
+		"Authentication required; complete explicit login".to_string(),
+		true,
+	);
+	let status = fixture.query_status().await;
+	assert!(status.name.is_none());
+	assert!(status.tunnel_id.is_none());
+	assert!(matches!(status.status.tunnel, TunnelState::Disconnected));
+	assert_eq!(
+		status.status.recovery,
+		Some(protocol::singleton::RecoveryState::AuthenticationRequired)
+	);
+	assert!(status
+		.status
+		.last_fail_reason
+		.unwrap()
+		.contains("explicit login"));
+}
+
 impl Drop for Fixture {
 	fn drop(&mut self) {
 		if let Some(client) = &self.client {

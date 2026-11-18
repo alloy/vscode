@@ -400,6 +400,18 @@ pub mod singleton {
 		pub last_connected_at: Option<Timestamp>,
 		pub last_disconnected_at: Option<Timestamp>,
 		pub last_fail_reason: Option<String>,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		pub recovery: Option<RecoveryState>,
+	}
+
+	#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+	pub enum RecoveryState {
+		Connecting,
+		Retrying,
+		AuthenticationRequired,
+		Closing,
+		CleanupBlocked,
+		Failed,
 	}
 
 	impl Default for Status {
@@ -410,6 +422,7 @@ pub mod singleton {
 				last_connected_at: None,
 				last_disconnected_at: None,
 				last_fail_reason: None,
+				recovery: None,
 			}
 		}
 	}

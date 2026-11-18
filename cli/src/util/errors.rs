@@ -142,6 +142,16 @@ impl std::error::Error for DevTunnelError {
 	}
 }
 
+#[derive(Debug, Error)]
+#[error("relay cleanup could not be verified; refusing a replacement: {0}")]
+pub struct RelayCleanupError(pub WrappedError);
+
+#[derive(Debug, Error)]
+#[error(
+	"Authentication required; run `{APPLICATION_NAME} tunnel user login` in a separate terminal"
+)]
+pub struct AuthenticationRequired();
+
 // When the server was downloaded, but the entrypoint scripts don't exist.
 #[derive(Debug)]
 pub struct MissingEntrypointError();
@@ -542,6 +552,8 @@ pub enum CodeError {
 makeAnyError!(
 	MismatchConnectionToken,
 	DevTunnelError,
+	RelayCleanupError,
+	AuthenticationRequired,
 	StatusError,
 	WrappedError,
 	InvalidServerExtensionError,

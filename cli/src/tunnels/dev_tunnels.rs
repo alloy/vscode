@@ -8,8 +8,8 @@ use crate::constants::{IS_INTERACTIVE_CLI, PROTOCOL_VERSION_TAG, TUNNEL_SERVICE_
 use crate::log;
 use crate::state::{LauncherPaths, PersistedState};
 use crate::util::errors::{
-	wrap, AnyError, CodeError, DevTunnelError, InvalidTunnelName, TunnelCreationFailed,
-	WrappedError,
+	wrap, AnyError, CodeError, DevTunnelError, InvalidTunnelName, RelayCleanupError,
+	TunnelCreationFailed, WrappedError,
 };
 use crate::util::input::prompt_placeholder;
 use futures::future::BoxFuture;
@@ -20,6 +20,7 @@ use rand::prelude::IteratorRandom;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
@@ -38,6 +39,9 @@ use tunnels::management::{
 static TUNNEL_COUNT_LIMIT_NAME: &str = "TunnelsPerUserPerLocation";
 static TUNNEL_PORT_PROTOCOL_CONFLICT_DETAIL: &str = "The tunnel port protocol cannot be changed.";
 static TUNNEL_SESSION_ID: LazyLock<uuid::Uuid> = LazyLock::new(uuid::Uuid::new_v4);
+const TOKEN_REFRESH_TIMEOUT: Duration = Duration::from_secs(60);
+const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
+const RELAY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn tunnel_correlation_id(
 	log: &log::Logger,
@@ -80,6 +84,12 @@ fn tunnel_management_client(log: &log::Logger) -> TunnelClientBuilder {
 		uuid::Uuid::new_v4(),
 	);
 	let mut client = new_tunnel_management(&TUNNEL_SERVICE_USER_AGENT);
+	client.client(
+		reqwest::Client::builder()
+			.timeout(TOKEN_REFRESH_TIMEOUT)
+			.build()
+			.expect("expected to create tunnel management HTTP client"),
+	);
 	client.additional_headers(vec![
 		(
 			HeaderName::from_static("x-tunnels-vscode-session-id"),
@@ -164,6 +174,10 @@ trait AccessTokenProvider: Send + Sync {
 	/// to ensure its stays current. Returns a future that should be polled and
 	/// only completes if a refresh fails in a consistent way.
 	fn keep_alive(&self) -> BoxFuture<'static, Result<(), AnyError>>;
+
+	fn authentication_required(&self) -> bool {
+		false
+	}
 }
 
 /// Access token provider that provides a fixed token without refreshing.
@@ -244,6 +258,10 @@ impl AccessTokenProvider for LookupAccessTokenProvider {
 	fn keep_alive(&self) -> BoxFuture<'static, Result<(), AnyError>> {
 		let auth = self.auth.clone();
 		auth.keep_token_alive().boxed()
+	}
+
+	fn authentication_required(&self) -> bool {
+		self.auth.authentication_required()
 	}
 }
 
@@ -994,7 +1012,7 @@ impl DevTunnels {
 			Ok(endpoint) => endpoint,
 			Err(e) => {
 				error!(self.log, "Error connecting to tunnel endpoint: {}", e);
-				manager.kill().await.ok();
+				manager.kill().await?;
 				return Err(e);
 			}
 		};
@@ -1023,16 +1041,26 @@ impl StatusLock {
 		self.0.send_modify(|status| {
 			status.tunnel = protocol::singleton::TunnelState::Connected;
 			status.last_connected_at = Some(jiff::Timestamp::now());
+			status.recovery = None;
 		});
 	}
 
 	pub(super) fn fail(&self, reason: String) {
+		self.fail_with_recovery(reason, protocol::singleton::RecoveryState::Retrying);
+	}
+
+	pub(super) fn fail_with_recovery(
+		&self,
+		reason: String,
+		recovery: protocol::singleton::RecoveryState,
+	) {
 		self.0.send_modify(|status| {
 			if let protocol::singleton::TunnelState::Connected = status.tunnel {
 				status.last_disconnected_at = Some(jiff::Timestamp::now());
 				status.tunnel = protocol::singleton::TunnelState::Disconnected;
 			}
 			status.last_fail_reason = Some(reason);
+			status.recovery = Some(recovery);
 		});
 	}
 
@@ -1042,6 +1070,7 @@ impl StatusLock {
 				status.tunnel = protocol::singleton::TunnelState::Disconnected;
 				status.last_disconnected_at = Some(jiff::Timestamp::now());
 				status.last_fail_reason = Some("Tunnel relay task stopped".to_string());
+				status.recovery = Some(protocol::singleton::RecoveryState::Failed);
 				true
 			} else {
 				false
@@ -1055,6 +1084,11 @@ impl StatusLock {
 
 	pub(super) fn subscribe(&self) -> watch::Receiver<protocol::singleton::Status> {
 		self.0.subscribe()
+	}
+
+	fn recovering(&self, recovery: protocol::singleton::RecoveryState) {
+		self.0
+			.send_modify(|status| status.recovery = Some(recovery));
 	}
 
 	#[cfg(test)]
@@ -1071,11 +1105,46 @@ impl Drop for TunnelStatusGuard {
 	}
 }
 
+struct TokenKeepAliveTask(tokio::task::JoinHandle<Result<(), AnyError>>);
+
+impl Drop for TokenKeepAliveTask {
+	fn drop(&mut self) {
+		self.0.abort();
+	}
+}
+
+fn keepalive_result(
+	result: Result<Result<(), AnyError>, tokio::task::JoinError>,
+) -> Result<(), AnyError> {
+	result.unwrap_or_else(|_| {
+		Err(wrap("", "Credential keep-alive worker stopped unexpectedly").into())
+	})
+}
+
+fn keepalive_failure(
+	error: AnyError,
+	authentication_required: bool,
+) -> (WrappedError, protocol::singleton::RecoveryState) {
+	if authentication_required || matches!(&error, AnyError::AuthenticationRequired(_)) {
+		(
+			wrap(error, "access token is no longer valid"),
+			protocol::singleton::RecoveryState::AuthenticationRequired,
+		)
+	} else {
+		(
+			wrap(error, "Credential maintenance failed"),
+			protocol::singleton::RecoveryState::Retrying,
+		)
+	}
+}
+
 struct ActiveTunnelManager {
+	log: log::Logger,
 	close_tx: Option<mpsc::Sender<()>>,
 	endpoint_rx: watch::Receiver<Option<Result<TunnelEndpoint, WrappedError>>>,
 	relay: Arc<tokio::sync::Mutex<RelayTunnelHost>>,
 	status: StatusLock,
+	worker: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ActiveTunnelManager {
@@ -1094,23 +1163,37 @@ impl ActiveTunnelManager {
 		let status = StatusLock::default();
 
 		let status_spawned = status.clone();
-		tokio::spawn(async move {
-			ActiveTunnelManager::spawn_tunnel(
-				log,
+		let endpoint_supervisor = endpoint_tx.clone();
+		let manager_log = log.clone();
+		let worker = tokio::spawn(async move {
+			let result = AssertUnwindSafe(ActiveTunnelManager::spawn_tunnel(
+				log.clone(),
 				relay_spawned,
 				close_rx,
 				endpoint_tx,
 				access_token,
-				status_spawned,
-			)
+				status_spawned.clone(),
+			))
+			.catch_unwind()
 			.await;
+			if result.is_err() {
+				let message = "Tunnel relay worker panicked; refusing an unverified replacement";
+				error!(log, "{}", message);
+				status_spawned.fail_with_recovery(
+					message.to_string(),
+					protocol::singleton::RecoveryState::Failed,
+				);
+				endpoint_supervisor.send_replace(Some(Err(wrap("", message))));
+			}
 		});
 
 		ActiveTunnelManager {
+			log: manager_log,
 			endpoint_rx,
 			relay,
 			close_tx: Some(close_tx),
 			status,
+			worker: Some(worker),
 		}
 	}
 
@@ -1213,14 +1296,49 @@ impl ActiveTunnelManager {
 			drop(tx);
 		}
 
-		self.relay
-			.lock()
-			.await
-			.unregister()
-			.await
-			.map_err(|e| wrap(e, "error unregistering relay"))?;
+		if let Some(worker) = self.worker.as_mut() {
+			let result = tokio::time::timeout(RELAY_CLEANUP_TIMEOUT, worker)
+				.await
+				.map_err(|e| {
+					self.status
+						.recovering(protocol::singleton::RecoveryState::CleanupBlocked);
+					RelayCleanupError(wrap(e, "Timed out waiting for relay cleanup"))
+				})?;
+			self.worker.take();
+			result.map_err(|e| RelayCleanupError(wrap(e, "error joining relay worker")))?;
+		}
 
-		while self.endpoint_rx.changed().await.is_ok() {}
+		if matches!(
+			self.status.read().recovery,
+			Some(
+				protocol::singleton::RecoveryState::Failed
+					| protocol::singleton::RecoveryState::CleanupBlocked
+			)
+		) {
+			return Err(
+				RelayCleanupError(wrap("", "relay worker could not verify cleanup")).into(),
+			);
+		}
+
+		// The worker has confirmed the connection is closed. An unavailable
+		// management API must not prevent recovery of a disconnected relay.
+		match tokio::time::timeout(RELAY_CLEANUP_TIMEOUT, async {
+			self.relay.lock().await.unregister().await
+		})
+		.await
+		{
+			Ok(Ok(_)) => {}
+			Ok(Err(error)) => warning!(
+				self.log,
+				"Relay closed but endpoint unregister failed: {}",
+				error
+			),
+			Err(error) => warning!(
+				self.log,
+				"Relay closed but endpoint unregister timed out: {}",
+				error
+			),
+		}
 
 		Ok(())
 	}
@@ -1249,7 +1367,10 @@ impl ActiveTunnelManager {
 			},
 			|handle: &tunnels::connections::RelayHandle| handle.endpoint().clone(),
 			|handle: tunnels::connections::RelayHandle| async move {
-				format!("{:?}", handle.close().await)
+				handle
+					.close()
+					.await
+					.map_err(|e| wrap(e, "error closing relay"))
 			},
 			close_rx,
 			endpoint_tx,
@@ -1274,27 +1395,65 @@ impl ActiveTunnelManager {
 		H: Future<Output = Result<(), E>> + Unpin + Send,
 		E: std::fmt::Display,
 		C: FnMut(H) -> CF + Send,
-		CF: Future<Output = String> + Send,
+		CF: Future<Output = Result<(), WrappedError>> + Send,
 	{
 		// The singleton outlives this task, including on cancellation or token failure.
 		let _status_guard = TunnelStatusGuard(status.clone());
-		let mut token_ka = access_token_provider.keep_alive();
 		let mut backoff = Backoff::new(Duration::from_secs(5), Duration::from_secs(120));
+		let mut token_ka: Option<TokenKeepAliveTask> = None;
+		let mut keepalive_finished = false;
 
 		macro_rules! fail {
 			($e: expr, $msg: expr) => {
-				let fmt = format!("{}: {}", $msg, $e);
+				let recovery = if access_token_provider.authentication_required() {
+					protocol::singleton::RecoveryState::AuthenticationRequired
+				} else {
+					protocol::singleton::RecoveryState::Retrying
+				};
+				fail!($e, $msg, recovery);
+			};
+			($e: expr, $msg: expr, $recovery: expr) => {
+				let error = $e;
+				let fmt = format!("{}: {}", $msg, error);
 				warning!(log, &fmt);
-				status.fail(fmt);
-				endpoint_tx.send(Some(Err($e))).ok();
-				backoff.delay().await;
+				status.fail_with_recovery(fmt, $recovery);
+				endpoint_tx.send(Some(Err(error))).ok();
+				tokio::select! {
+					_ = close_rx.recv() => return,
+					_ = backoff.delay() => {},
+				}
 			};
 		}
 
 		loop {
+			if close_rx.is_closed() {
+				break;
+			}
+			if token_ka.as_ref().is_some_and(|task| task.0.is_finished()) {
+				let mut task = token_ka.take().unwrap();
+				match keepalive_result((&mut task.0).await) {
+					Ok(()) => keepalive_finished = true,
+					Err(error) => {
+						let (error, recovery) = keepalive_failure(
+							error,
+							access_token_provider.authentication_required(),
+						);
+						fail!(error, "Credential keep-alive failed, will retry", recovery);
+						continue;
+					}
+				}
+			}
 			debug!(log, "Starting tunnel to server...");
+			status.recovering(protocol::singleton::RecoveryState::Connecting);
 
-			let access_token = match access_token_provider.refresh_token().await {
+			let token_result = tokio::select! {
+				biased;
+				_ = close_rx.recv() => break,
+				result = tokio::time::timeout(TOKEN_REFRESH_TIMEOUT, access_token_provider.refresh_token()) => {
+					result.unwrap_or_else(|e| Err(wrap(e, "timed out acquiring tunnel token")))
+				},
+			};
+			let access_token = match token_result {
 				Ok(t) => t,
 				Err(e) => {
 					fail!(e, "Error refreshing access token, will retry");
@@ -1304,7 +1463,13 @@ impl ActiveTunnelManager {
 
 			// we don't bother making a client that can refresh the token, since
 			// the tunnel won't be able to host as soon as the access token expires.
-			let handle_res = connect(access_token).await;
+			let handle_res = tokio::select! {
+				biased;
+				_ = close_rx.recv() => break,
+				result = tokio::time::timeout(RELAY_CONNECT_TIMEOUT, connect(access_token)) => {
+					result.unwrap_or_else(|e| Err(wrap(e, "timed out connecting to relay")))
+				},
+			};
 
 			let mut handle = match handle_res {
 				Ok(handle) => handle,
@@ -1318,7 +1483,19 @@ impl ActiveTunnelManager {
 			status.succeed();
 			endpoint_tx.send(Some(Ok(endpoint(&handle)))).ok();
 
-			tokio::select! {
+			if token_ka.is_none() && !keepalive_finished {
+				token_ka = Some(TokenKeepAliveTask(tokio::spawn(
+					access_token_provider.keep_alive(),
+				)));
+			}
+			loop {
+				tokio::select! {
+				biased;
+				_ = close_rx.recv() => {
+					status.fail_with_recovery("Tunnel relay task stopped".to_string(), protocol::singleton::RecoveryState::Closing);
+					Self::close_relay(&log, &status, close(handle)).await;
+					return;
+				},
 				// error is mapped like this prevent it being used across an await,
 				// which Rust dislikes since there's a non-sendable dyn Error in there
 				res = (&mut handle).map_err(|e| wrap(e, "error from tunnel connection")) => {
@@ -1327,22 +1504,76 @@ impl ActiveTunnelManager {
 					} else {
 						status.fail("Tunnel exited unexpectedly but gracefully, reconnecting".to_string());
 						warning!(log, "Tunnel exited unexpectedly but gracefully, reconnecting");
-						backoff.delay().await;
+						tokio::select! {
+							_ = close_rx.recv() => return,
+							_ = backoff.delay() => {},
+						}
+					}
+					break;
+				},
+				result = async { (&mut token_ka.as_mut().unwrap().0).await }, if token_ka.is_some() => {
+					drop(token_ka.take());
+					if let Err(e) = keepalive_result(result) {
+						let (error, recovery) = keepalive_failure(e, access_token_provider.authentication_required());
+						warning!(log, "{}", error);
+						status.fail_with_recovery(error.to_string(), recovery);
+						endpoint_tx.send(Some(Err(error))).ok();
+						// Dropping the pinned SDK's RelayHandle detaches its worker.
+						// Confirm closure before establishing a replacement connection.
+						if !Self::close_relay(&log, &status, close(handle)).await {
+							return;
+						}
+						tokio::select! {
+							_ = close_rx.recv() => return,
+							_ = backoff.delay() => {},
+						}
+						break;
+					} else {
+						keepalive_finished = true;
 					}
 				},
-				Err(e) = &mut token_ka => {
-					error!(log, "access token is no longer valid, exiting: {}", e);
-					let error = wrap(e, "access token is no longer valid");
-					status.fail(error.to_string());
-					endpoint_tx.send(Some(Err(error))).ok();
-					return;
-				},
-				_ = close_rx.recv() => {
-					status.disconnect_if_connected();
-					trace!(log, "Tunnel closing gracefully");
-					trace!(log, "Tunnel closed with result: {}", close(handle).await);
-					break;
 				}
+			}
+		}
+	}
+
+	async fn close_relay(
+		log: &log::Logger,
+		status: &StatusLock,
+		close: impl Future<Output = Result<(), WrappedError>>,
+	) -> bool {
+		let previous_recovery = status.read().recovery;
+		tokio::pin!(close);
+		let result = tokio::select! {
+			result = &mut close => result,
+			_ = tokio::time::sleep(RELAY_CLEANUP_TIMEOUT) => {
+				let message = "Relay cleanup is blocked; waiting before reconnecting";
+				warning!(log, "{}", message);
+				status.fail_with_recovery(message.to_string(), protocol::singleton::RecoveryState::CleanupBlocked);
+				close.await
+			},
+		};
+		match result {
+			Ok(()) => {
+				if status.read().recovery
+					== Some(protocol::singleton::RecoveryState::CleanupBlocked)
+				{
+					status.recovering(
+						previous_recovery.unwrap_or(protocol::singleton::RecoveryState::Closing),
+					);
+				}
+				true
+			}
+			Err(error) => {
+				error!(
+					log,
+					"Relay cleanup failed; replacement is unsafe: {}", error
+				);
+				status.fail_with_recovery(
+					"Relay cleanup failed; replacement is unsafe".to_string(),
+					protocol::singleton::RecoveryState::Failed,
+				);
+				false
 			}
 		}
 	}
@@ -1351,6 +1582,14 @@ impl ActiveTunnelManager {
 #[cfg(test)]
 #[path = "stale_health_relay_tests.rs"]
 mod stale_health_regression;
+
+#[cfg(test)]
+#[path = "native_relay_recovery_tests.rs"]
+mod native_recovery;
+
+#[cfg(test)]
+#[path = "native_recovery_cli_tests.rs"]
+mod native_recovery_cli_tests;
 
 struct Backoff {
 	failures: u32,

@@ -41,6 +41,10 @@ use tokio::{
 #[path = "stale_health_rpc_tests.rs"]
 pub(super) mod stale_health_regression;
 
+#[cfg(test)]
+#[path = "native_recovery_rpc_fixture.rs"]
+pub(super) mod native_recovery_rpc_fixture;
+
 pub struct SingletonServerArgs<'a> {
 	pub server: &'a mut RpcServer,
 	pub log: log::Logger,
@@ -78,6 +82,7 @@ struct SingletonServerContext {
 	// However, this should be safe, as the lock is only used for immediate
 	// data reads (in the `status` method).
 	current_status: Arc<Mutex<Option<StatusInfo>>>,
+	startup_status: StatusLock,
 }
 
 pub struct RpcServer {
@@ -85,9 +90,24 @@ pub struct RpcServer {
 	shutdown_broadcast: broadcast::Sender<ShutdownSignal>,
 	current_status: Arc<Mutex<Option<StatusInfo>>>,
 	status_reports: watch::Sender<Option<ConnectionReporter>>,
+	startup_status: StatusLock,
 }
 
 impl RpcServer {
+	pub fn report_startup_failure(&self, reason: String, authentication_required: bool) {
+		let recovery = if authentication_required {
+			protocol::singleton::RecoveryState::AuthenticationRequired
+		} else {
+			protocol::singleton::RecoveryState::Retrying
+		};
+		let status = self.current_status.lock().unwrap();
+		let status = status
+			.as_ref()
+			.map(|s| &s.lock)
+			.unwrap_or(&self.startup_status);
+		status.fail_with_recovery(reason, recovery);
+	}
+
 	fn set_current_status(&mut self, status: StatusInfo) {
 		let mut changes = status.lock.subscribe();
 		// Initial readiness is reported by startup, not by this reconnect observer.
@@ -112,12 +132,14 @@ pub fn make_singleton_server(
 	let rpc = new_json_rpc();
 
 	let current_status = Arc::new(Mutex::default());
+	let startup_status = StatusLock::default();
 	let (status_reports, status_reports_rx) = watch::channel(None);
 	let mut rpc = rpc.methods(SingletonServerContext {
 		log: log.clone(),
 		shutdown_tx: shutdown_broadcast.clone(),
 		broadcast_tx: log_broadcast.get_brocaster(),
 		current_status: current_status.clone(),
+		startup_status: startup_status.clone(),
 	});
 
 	rpc.register_sync(
@@ -141,7 +163,10 @@ pub fn make_singleton_server(
 					has_editor_link: Some(true),
 					status: s.lock.read(),
 				})
-				.unwrap_or_default())
+				.unwrap_or_else(|| protocol::singleton::StatusWithTunnelName {
+					status: c.startup_status.read(),
+					..Default::default()
+				}))
 		},
 	);
 
@@ -179,6 +204,7 @@ pub fn make_singleton_server(
 		shutdown_broadcast,
 		current_status,
 		status_reports,
+		startup_status,
 		fut,
 	}
 }
@@ -406,6 +432,7 @@ mod tests {
 			log: log::Logger::test(),
 			shutdown_tx,
 			broadcast_tx,
+			startup_status: StatusLock::default(),
 			current_status: Arc::new(Mutex::new(Some(StatusInfo {
 				name: "test-host".to_string(),
 				tunnel_id: "test-id".to_string(),

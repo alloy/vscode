@@ -88,3 +88,6 @@ lto = "thin"
 default = []
 vsda = []
 vscode-encrypt = []
+
+[dev-dependencies]
+tokio = { version = "1.52", features = ["test-util"] }

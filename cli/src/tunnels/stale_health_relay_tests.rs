@@ -11,7 +11,10 @@ use std::{
 };
 use tokio::{sync::oneshot, task::JoinHandle};
 
-struct ControlledToken(Mutex<Option<oneshot::Receiver<()>>>);
+struct ControlledToken {
+	failure: Mutex<Option<oneshot::Receiver<()>>>,
+	rejected: Arc<std::sync::atomic::AtomicBool>,
+}
 
 impl AccessTokenProvider for ControlledToken {
 	async fn refresh_token(&self) -> Result<String, WrappedError> {
@@ -19,12 +22,20 @@ impl AccessTokenProvider for ControlledToken {
 	}
 
 	fn keep_alive(&self) -> BoxFuture<'static, Result<(), AnyError>> {
-		let failure = self.0.lock().unwrap().take().unwrap();
+		let Some(failure) = self.failure.lock().unwrap().take() else {
+			return futures::future::pending().boxed();
+		};
+		let rejected = self.rejected.clone();
 		async move {
 			let _ = failure.await;
+			rejected.store(true, std::sync::atomic::Ordering::SeqCst);
 			Err(DevTunnelError("synthetic-keepalive-rejected".to_string()).into())
 		}
 		.boxed()
+	}
+
+	fn authentication_required(&self) -> bool {
+		self.rejected.load(std::sync::atomic::Ordering::SeqCst)
 	}
 }
 
@@ -101,11 +112,14 @@ impl Fixture {
 			|mut handle: ControlledHandle| async move {
 				handle.close_started.take().unwrap().send(()).unwrap();
 				let _ = handle.close_release.await;
-				"Ok(())".to_string()
+				Ok(())
 			},
 			close_rx,
 			endpoint_tx,
-			ControlledToken(Mutex::new(Some(failure_rx))),
+			ControlledToken {
+				failure: Mutex::new(Some(failure_rx)),
+				rejected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+			},
 			status.clone(),
 		));
 		let mut fixture = Self {
@@ -154,10 +168,14 @@ impl Fixture {
 async fn keepalive_failure_updates_status_and_endpoint_observer() {
 	let mut fixture = Fixture::connected().await;
 	fixture.token_failure.take().unwrap().send(()).unwrap();
-	tokio::time::timeout(Duration::from_secs(2), &mut fixture.task)
+	tokio::time::timeout(Duration::from_secs(2), fixture.endpoint.changed())
 		.await
 		.unwrap()
 		.unwrap();
+	assert!(
+		!fixture.task.is_finished(),
+		"the worker must remain available for recovery"
+	);
 	fixture.assert_disconnected("synthetic-keepalive-rejected");
 	let observed = fixture.endpoint.borrow();
 	let error = observed
@@ -169,6 +187,18 @@ async fn keepalive_failure_updates_status_and_endpoint_observer() {
 	assert!(error
 		.to_string()
 		.contains("access token is no longer valid"));
+	drop(observed);
+	fixture.relays[0]
+		.close_release
+		.take()
+		.unwrap()
+		.send(())
+		.unwrap();
+	tokio::time::timeout(Duration::from_secs(8), fixture.endpoint.changed())
+		.await
+		.unwrap()
+		.unwrap();
+	assert!(fixture.endpoint.borrow().as_ref().unwrap().is_ok());
 }
 
 #[tokio::test]
